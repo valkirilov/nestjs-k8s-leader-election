@@ -33,6 +33,8 @@ export class LeaderElectionService implements OnApplicationBootstrap {
   private logAtLevel: "log" | "debug";
   private leaseRenewalTimeout: NodeJS.Timeout | null = null;
   private awaitLeadership: boolean;
+  private maxConsecutiveFailures: number;
+  private consecutiveFailures = 0;
   LEADER_IDENTITY = `nestjs-${process.env.HOSTNAME}`;
 
   constructor(
@@ -50,6 +52,7 @@ export class LeaderElectionService implements OnApplicationBootstrap {
     this.durationInSeconds = 2 * (this.renewalInterval / 1000);
     this.logAtLevel = options.logAtLevel ?? "log";
     this.awaitLeadership = options.awaitLeadership ?? false;
+    this.maxConsecutiveFailures = options.maxConsecutiveFailures ?? 3;
 
     process.on("SIGINT", () => this.gracefulShutdown());
     process.on("SIGTERM", () => this.gracefulShutdown());
@@ -142,30 +145,51 @@ export class LeaderElectionService implements OnApplicationBootstrap {
 
   private async renewLease() {
     try {
+      // Read the current lease state
       let lease: V1Lease = await this.getLease();
-      if (this.isLeaseHeldByUs(lease)) {
-        this.logger[this.logAtLevel]("Renewing lease...");
-        lease.spec.renewTime = new V1MicroTime(new Date());
-        try {
-          const { body } = await this.kubeClient.replaceNamespacedLease(
-            this.leaseName,
-            this.namespace,
-            lease
-          );
-          this.logger[this.logAtLevel]("Successfully renewed lease");
-          return body;
-        } catch (error) {
-          this.logger.error({ message: "Error while renewing lease", error });
-          throw error;
-        }
-      } else {
+      
+      if (!this.isLeaseHeldByUs(lease)) {
+        this.logger.warn("Lease is no longer held by us. Losing leadership.");
         this.loseLeadership();
+        return;
       }
+
+      this.logger[this.logAtLevel]("Renewing lease...");
+      lease.spec.renewTime = new V1MicroTime(new Date());
+      
+      // Try to renew the lease
+      const { body } = await this.kubeClient.replaceNamespacedLease(
+        this.leaseName,
+        this.namespace,
+        lease
+      );
+      
+      this.consecutiveFailures = 0; // Reset failure count on success
+      this.logger[this.logAtLevel]("Successfully renewed lease");
+      return body;
     } catch (error) {
       this.logger.error({ message: "Error while renewing lease", error });
-      this.loseLeadership();
+      this.handleRenewalFailure(error);
+      throw error; // Propagate for outer try-catch in scheduleLeaseRenewal
     }
   }
+
+  private handleRenewalFailure(error: any) {
+    this.consecutiveFailures++;
+
+    if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+      this.logger.error(
+        `Failed to renew lease ${this.consecutiveFailures} times consecutively. Giving up leadership.`
+      );
+      this.loseLeadership();
+    } else {
+      this.logger.warn(
+        `Failed to renew lease (${this.consecutiveFailures}/${this.maxConsecutiveFailures} failures). Will retry with exponential backoff.`
+      );
+      // Don't give up leadership yet - wait for next renewal attempt with backoff
+    }
+  }
+
 
   private async getLease(): Promise<V1Lease> {
     try {
@@ -178,9 +202,8 @@ export class LeaderElectionService implements OnApplicationBootstrap {
       if (error.response && error.response.statusCode === 404) {
         this.logger[this.logAtLevel]("Lease not found. Creating lease...");
         return this.createLease();
-      } else {
-        throw error;
       }
+      throw error;
     }
   }
 
@@ -265,6 +288,7 @@ export class LeaderElectionService implements OnApplicationBootstrap {
 
   private becomeLeader() {
     this.isLeader = true;
+    this.consecutiveFailures = 0; // Reset failure count when becoming leader
     this.emitLeaderElectedEvent();
     this.scheduleLeaseRenewal();
   }
@@ -328,20 +352,40 @@ export class LeaderElectionService implements OnApplicationBootstrap {
     // Clear any existing lease renewal timeout.
     if (this.leaseRenewalTimeout) {
       clearTimeout(this.leaseRenewalTimeout);
+      this.leaseRenewalTimeout = null;
     }
 
-    // Schedule the lease renewal to happen at the renewalInterval.
-    // The renewal should occur before the lease duration expires.
+    // Don't schedule if we're not the leader
+    if (!this.isLeader) {
+      return;
+    }
+
+    // Calculate delay with exponential backoff based on consecutive failures
+    // 0 failures: renewalInterval (10s)
+    // 1 failure:  renewalInterval * 2 (20s)
+    // 2 failures: renewalInterval * 4 (40s)
+    const backoffMultiplier = Math.pow(2, this.consecutiveFailures);
+    const delayMs = this.renewalInterval * backoffMultiplier;
+
+    this.logger[this.logAtLevel](
+      `Scheduling next lease renewal in ${delayMs}ms (failures: ${this.consecutiveFailures})`
+    );
+
+    // Schedule the lease renewal
     this.leaseRenewalTimeout = setTimeout(async () => {
       if (this.isLeader) {
         try {
           await this.renewLease();
         } catch (error) {
-          this.logger.error({ message: "Error while renewing lease", error });
-          // If lease renewal fails, consider handling it by attempting to re-acquire leadership or similar.
+          // Error already logged in renewLease
+        }
+        
+        // Schedule next renewal if still leader
+        if (this.isLeader) {
+          this.scheduleLeaseRenewal();
         }
       }
-    }, this.renewalInterval);
+    }, delayMs);
   }
 
   private handleLeaseUpdate(leaseObj: V1Lease) {
