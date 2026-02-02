@@ -42,9 +42,7 @@ jobs:
       run: npm ci
       
     - name: Run tests
-      run: |
-        npx prisma generate
-        npm run test:ci
+      run: npm run test:ci
 
     - name: Test Report
       uses: dorny/test-reporter@v1
